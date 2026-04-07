@@ -65,7 +65,14 @@ import time
 import requests
 from typing import Dict, Any, Optional, List
 from pathlib import Path
-from agent.auxiliary_client import call_llm
+_call_llm = None
+
+def _get_call_llm():
+    global _call_llm
+    if _call_llm is None:
+        from agent.auxiliary_client import call_llm
+        _call_llm = call_llm
+    return _call_llm
 from hermes_constants import get_hermes_home
 
 try:
@@ -1225,7 +1232,7 @@ def _extract_relevant_content(
         model = _get_extraction_model()
         if model:
             call_kwargs["model"] = model
-        response = call_llm(**call_kwargs)
+        response = _get_call_llm()(**call_kwargs)
         extracted = (response.choices[0].message.content or "").strip() or _truncate_snapshot(snapshot_text)
         # Redact any secrets the auxiliary LLM may have echoed back.
         return redact_sensitive_text(extracted)
@@ -2015,7 +2022,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
             call_kwargs["model"] = vision_model
         # Try full-size screenshot; on size-related rejection, downscale and retry.
         try:
-            response = call_llm(**call_kwargs)
+            response = _get_call_llm()(**call_kwargs)
         except Exception as _api_err:
             from tools.vision_tools import (
                 _is_image_size_error, _resize_image_for_vision, _RESIZE_TARGET_BYTES,
@@ -2031,7 +2038,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
                 data_url = _resize_image_for_vision(
                     screenshot_path, mime_type="image/png")
                 call_kwargs["messages"][0]["content"][1]["image_url"]["url"] = data_url
-                response = call_llm(**call_kwargs)
+                response = _get_call_llm()(**call_kwargs)
             else:
                 raise
         
