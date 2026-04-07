@@ -129,6 +129,7 @@ def _run_async(coro):
 # Tool Discovery  (importing each module triggers its registry.register calls)
 # =============================================================================
 
+
 def _discover_tools():
     """Import all tool modules to trigger their registry.register() calls.
 
@@ -169,19 +170,34 @@ def _discover_tools():
 
 _discover_tools()
 
-# MCP tool discovery (external MCP servers from config)
-try:
-    from tools.mcp_tool import discover_mcp_tools
-    discover_mcp_tools()
-except Exception as e:
-    logger.debug("MCP tool discovery failed: %s", e)
+# MCP and Plugin discovery are deferred until first access via getter functions
+# This saves 600-700ms at startup
+_mcp_tools_discovered = False
+_plugin_tools_discovered = False
 
-# Plugin tool discovery (user/project/pip plugins)
-try:
-    from hermes_cli.plugins import discover_plugins
-    discover_plugins()
-except Exception as e:
-    logger.debug("Plugin discovery failed: %s", e)
+def _ensure_mcp_tools():
+    """Lazy-load MCP tools on first access."""
+    global _mcp_tools_discovered
+    if _mcp_tools_discovered:
+        return
+    try:
+        from tools.mcp_tool import discover_mcp_tools
+        discover_mcp_tools()
+        _mcp_tools_discovered = True
+    except Exception as e:
+        logger.debug("MCP tool discovery failed: %s", e)
+
+def _ensure_plugin_tools():
+    """Lazy-load plugin tools on first access."""
+    global _plugin_tools_discovered
+    if _plugin_tools_discovered:
+        return
+    try:
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()
+        _plugin_tools_discovered = True
+    except Exception as e:
+        logger.debug("Plugin discovery failed: %s", e)
 
 
 # =============================================================================
@@ -249,6 +265,10 @@ def get_tool_definitions(
     Returns:
         Filtered list of OpenAI-format tool definitions.
     """
+    # Ensure MCP and Plugin tools are discovered before we resolve toolsets
+    _ensure_mcp_tools()
+    _ensure_plugin_tools()
+
     # Determine which tool names the caller wants
     tools_to_include: set = set()
 
