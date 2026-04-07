@@ -47,12 +47,6 @@ import re
 import asyncio
 from typing import List, Dict, Any, Optional
 import httpx
-from firecrawl import Firecrawl
-from agent.auxiliary_client import (
-    async_call_llm,
-    extract_content_or_reasoning,
-    get_async_text_auxiliary_client,
-)
 from tools.debug_helpers import DebugSession
 from tools.managed_tool_gateway import (
     build_vendor_gateway_url,
@@ -62,6 +56,26 @@ from tools.managed_tool_gateway import (
 from tools.tool_backend_helpers import managed_nous_tools_enabled
 from tools.url_safety import is_safe_url
 from tools.website_policy import check_website_access
+
+# Deferred imports — only loaded when needed. Saves ~1.4s at startup.
+Firecrawl = None
+_async_call_llm = None
+_get_async_text_auxiliary_client = None
+_extract_content_or_reasoning = None
+
+def _load_firecrawl():
+    global Firecrawl
+    if Firecrawl is None:
+        from firecrawl import Firecrawl as _Firecrawl
+        Firecrawl = _Firecrawl
+
+def _load_auxiliary_client():
+    global _async_call_llm, _get_async_text_auxiliary_client, _extract_content_or_reasoning
+    if _async_call_llm is None:
+        from agent.auxiliary_client import async_call_llm, get_async_text_auxiliary_client, extract_content_or_reasoning
+        _async_call_llm = async_call_llm
+        _get_async_text_auxiliary_client = get_async_text_auxiliary_client
+        _extract_content_or_reasoning = extract_content_or_reasoning
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +223,8 @@ def _get_firecrawl_client():
     Hermes falls back to the Firecrawl tool-gateway for logged-in Nous Subscribers.
     """
     global _firecrawl_client, _firecrawl_client_config
+
+    _load_firecrawl()  # Deferred import
 
     direct_config = _get_direct_firecrawl_config()
     if direct_config is not None:
@@ -454,7 +470,8 @@ def _is_nous_auxiliary_client(client: Any) -> bool:
 
 def _resolve_web_extract_auxiliary(model: Optional[str] = None) -> tuple[Optional[Any], Optional[str], Dict[str, Any]]:
     """Resolve the current web-extract auxiliary client, model, and extra body."""
-    client, default_model = get_async_text_auxiliary_client("web_extract")
+    _load_auxiliary_client()  # Deferred import
+    client, default_model = _get_async_text_auxiliary_client("web_extract")
     configured_model = os.getenv("AUXILIARY_WEB_EXTRACT_MODEL", "").strip()
     effective_model = model or configured_model or default_model
 
@@ -663,8 +680,8 @@ Create a markdown summary that captures all key information in a well-organized,
             }
             if extra_body:
                 call_kwargs["extra_body"] = extra_body
-            response = await async_call_llm(**call_kwargs)
-            content = extract_content_or_reasoning(response)
+            response = await _async_call_llm(**call_kwargs)
+            content = _extract_content_or_reasoning(response)
             if content:
                 return content
             # Reasoning-only / empty response — let the retry loop handle it
@@ -800,14 +817,14 @@ Create a single, unified markdown summary."""
         }
         if extra_body:
             call_kwargs["extra_body"] = extra_body
-        response = await async_call_llm(**call_kwargs)
-        final_summary = extract_content_or_reasoning(response)
+        response = await _async_call_llm(**call_kwargs)
+        final_summary = _extract_content_or_reasoning(response)
 
         # Retry once on empty content (reasoning-only response)
         if not final_summary:
             logger.warning("Synthesis LLM returned empty content, retrying once")
-            response = await async_call_llm(**call_kwargs)
-            final_summary = extract_content_or_reasoning(response)
+            response = await _async_call_llm(**call_kwargs)
+            final_summary = _extract_content_or_reasoning(response)
 
         # If still None after retry, fall back to concatenated summaries
         if not final_summary:
