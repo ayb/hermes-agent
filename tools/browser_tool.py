@@ -64,7 +64,14 @@ import time
 import requests
 from typing import Dict, Any, Optional, List
 from pathlib import Path
-from agent.auxiliary_client import call_llm
+_call_llm = None
+
+def _get_call_llm():
+    global _call_llm
+    if _call_llm is None:
+        from agent.auxiliary_client import call_llm
+        _call_llm = call_llm
+    return _call_llm
 from hermes_constants import get_hermes_home
 
 try:
@@ -1086,7 +1093,7 @@ def _extract_relevant_content(
         model = _get_extraction_model()
         if model:
             call_kwargs["model"] = model
-        response = call_llm(**call_kwargs)
+        response = _get_call_llm()(**call_kwargs)
         extracted = (response.choices[0].message.content or "").strip() or _truncate_snapshot(snapshot_text)
         # Redact any secrets the auxiliary LLM may have echoed back.
         return redact_sensitive_text(extracted)
@@ -1859,7 +1866,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         }
         if vision_model:
             call_kwargs["model"] = vision_model
-        response = call_llm(**call_kwargs)
+        response = _get_call_llm()(**call_kwargs)
         
         analysis = (response.choices[0].message.content or "").strip()
         # Redact secrets the vision LLM may have read from the screenshot.
