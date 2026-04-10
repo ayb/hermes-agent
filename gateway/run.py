@@ -582,6 +582,82 @@ class GatewayRunner:
         except Exception:
             return False
 
+    # -- Audio skill auto-loading ----------------------------------------
+
+    def _maybe_load_audio_skill(
+        self,
+        event: "MessageEvent",
+        source: "SessionSource",
+        is_new_session: bool,
+        task_id: Optional[str],
+    ) -> None:
+        """Auto-load platform-specific audio processing skill for voice messages.
+
+        Checks for a skill named '<platform>-audio-processing' (e.g., 'telegram-audio-processing')
+        and loads it into the event text if found and not already loaded.
+        """
+        platform = source.platform.value if source.platform else None
+        if not platform:
+            logger.debug("[Gateway] No platform detected, skipping audio skill auto-load")
+            return
+
+        skill_name = f"{platform}-audio-processing"
+        logger.info("[Gateway] Looking for audio skill: %s", skill_name)
+
+        # Skip if already loaded (check via auto_skill or if text already has skill instructions)
+        if getattr(event, "auto_skill", None) == skill_name:
+            logger.info("[Gateway] Audio skill '%s' already loaded", skill_name)
+            return
+
+        try:
+            from tools.skill_manager_tool import _find_skill
+            from agent.skill_commands import _load_skill_payload, _build_skill_message
+
+            # Check if skill exists
+            skill_info = _find_skill(skill_name)
+            if skill_info is None:
+                logger.info("[Gateway] Audio skill '%s' not found", skill_name)
+                return
+
+            logger.info("[Gateway] Found audio skill '%s', loading...", skill_name)
+
+            # Load the skill
+            loaded = _load_skill_payload(skill_name, task_id=task_id)
+            if not loaded:
+                logger.warning("[Gateway] Failed to load audio skill '%s' payload", skill_name)
+                return
+
+            loaded_skill, skill_dir, display_name = loaded
+
+            # Build activation message - only for new sessions to avoid duplicating
+            if is_new_session:
+                activation_note = (
+                    f'[SYSTEM: Voice message received. The "{display_name}" skill '
+                    f"is auto-loaded for this session. Follow its instructions for handling audio messages.]"
+                )
+            else:
+                # For existing sessions, inject a lighter note since skill content is in history
+                activation_note = "[SYSTEM: Voice message - refer to audio handling instructions from earlier.]"
+
+            skill_msg = _build_skill_message(
+                loaded_skill, skill_dir, activation_note,
+                user_instruction="",
+            )
+            if skill_msg:
+                # Prepend skill instructions to the transcribed message
+                original_text = event.text or ""
+                event.text = f"{skill_msg}\n\n{original_text}" if original_text else skill_msg
+                event.auto_skill = skill_name
+                logger.info(
+                    "[Gateway] Successfully auto-loaded audio skill '%s' for %s voice message",
+                    skill_name, platform,
+                )
+            else:
+                logger.warning("[Gateway] Built empty skill message for '%s'", skill_name)
+
+        except Exception as e:
+            logger.warning("[Gateway] Failed to auto-load audio skill '%s': %s", skill_name, e)
+
     # -- Voice mode persistence ------------------------------------------
 
     _VOICE_MODE_PATH = _hermes_home / "gateway_voice_mode.json"
@@ -2793,6 +2869,13 @@ class GatewayRunner:
                             )
                         except Exception:
                             pass
+
+        # -----------------------------------------------------------------
+        # Auto-load platform-specific audio processing skill for voice messages
+        # -----------------------------------------------------------------
+        if event.message_type in (MessageType.VOICE, MessageType.AUDIO):
+            logger.info("[Gateway] Voice/audio message detected, attempting skill auto-load")
+            self._maybe_load_audio_skill(event, source, _is_new_session, _quick_key)
 
         # -----------------------------------------------------------------
         # Enrich document messages with context notes for the agent
