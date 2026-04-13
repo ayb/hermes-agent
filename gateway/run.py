@@ -7319,6 +7319,21 @@ class GatewayRunner:
                         f'[The user sent a voice message~ '
                         f'Here\'s what they said: "{transcript}"]'
                     )
+                    # Archive voice message and transcription
+                    try:
+                        import subprocess
+                        archive_script = os.path.expanduser(
+                            "~/.hermes/skills/telegram-audio-processing/scripts/archive_voice_message.py"
+                        )
+                        if os.path.exists(archive_script):
+                            subprocess.run(
+                                ["python3", archive_script, path, transcript],
+                                check=False,
+                                capture_output=True,
+                            )
+                            logger.debug("Archived voice message: %s", path)
+                    except Exception as archive_err:
+                        logger.debug("Failed to archive voice message: %s", archive_err)
                 else:
                     error = result.get("error", "unknown error")
                     if (
