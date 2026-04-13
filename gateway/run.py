@@ -646,6 +646,82 @@ class GatewayRunner:
         except Exception:
             return False
 
+    # -- Audio skill auto-loading ----------------------------------------
+
+    def _maybe_load_audio_skill(
+        self,
+        event: "MessageEvent",
+        source: "SessionSource",
+        is_new_session: bool,
+        task_id: Optional[str],
+    ) -> None:
+        """Auto-load platform-specific audio processing skill for voice messages.
+
+        Checks for a skill named '<platform>-audio-processing' (e.g., 'telegram-audio-processing')
+        and loads it into the event text if found and not already loaded.
+        """
+        platform = source.platform.value if source.platform else None
+        if not platform:
+            logger.debug("[Gateway] No platform detected, skipping audio skill auto-load")
+            return
+
+        skill_name = f"{platform}-audio-processing"
+        logger.info("[Gateway] Looking for audio skill: %s", skill_name)
+
+        # Skip if already loaded (check via auto_skill or if text already has skill instructions)
+        if getattr(event, "auto_skill", None) == skill_name:
+            logger.info("[Gateway] Audio skill '%s' already loaded", skill_name)
+            return
+
+        try:
+            from tools.skill_manager_tool import _find_skill
+            from agent.skill_commands import _load_skill_payload, _build_skill_message
+
+            # Check if skill exists
+            skill_info = _find_skill(skill_name)
+            if skill_info is None:
+                logger.info("[Gateway] Audio skill '%s' not found", skill_name)
+                return
+
+            logger.info("[Gateway] Found audio skill '%s', loading...", skill_name)
+
+            # Load the skill
+            loaded = _load_skill_payload(skill_name, task_id=task_id)
+            if not loaded:
+                logger.warning("[Gateway] Failed to load audio skill '%s' payload", skill_name)
+                return
+
+            loaded_skill, skill_dir, display_name = loaded
+
+            # Build activation message - only for new sessions to avoid duplicating
+            if is_new_session:
+                activation_note = (
+                    f'[SYSTEM: Voice message received. The "{display_name}" skill '
+                    f"is auto-loaded for this session. Follow its instructions for handling audio messages.]"
+                )
+            else:
+                # For existing sessions, inject a lighter note since skill content is in history
+                activation_note = "[SYSTEM: Voice message - refer to audio handling instructions from earlier.]"
+
+            skill_msg = _build_skill_message(
+                loaded_skill, skill_dir, activation_note,
+                user_instruction="",
+            )
+            if skill_msg:
+                # Prepend skill instructions to the transcribed message
+                original_text = event.text or ""
+                event.text = f"{skill_msg}\n\n{original_text}" if original_text else skill_msg
+                event.auto_skill = skill_name
+                logger.info(
+                    "[Gateway] Successfully auto-loaded audio skill '%s' for %s voice message",
+                    skill_name, platform,
+                )
+            else:
+                logger.warning("[Gateway] Built empty skill message for '%s'", skill_name)
+
+        except Exception as e:
+            logger.warning("[Gateway] Failed to auto-load audio skill '%s': %s", skill_name, e)
+
     # -- Voice mode persistence ------------------------------------------
 
     _VOICE_MODE_PATH = _hermes_home / "gateway_voice_mode.json"
@@ -3552,6 +3628,140 @@ class GatewayRunner:
         )
         if message_text is None:
             return
+        if _is_shared_thread and source.user_name:
+            message_text = f"[{source.user_name}] {message_text}"
+
+        if event.media_urls:
+            image_paths = []
+            for i, path in enumerate(event.media_urls):
+                # Check media_types if available; otherwise infer from message type
+                mtype = event.media_types[i] if i < len(event.media_types) else ""
+                is_image = (
+                    mtype.startswith("image/")
+                    or event.message_type == MessageType.PHOTO
+                )
+                if is_image:
+                    image_paths.append(path)
+            if image_paths:
+                message_text = await self._enrich_message_with_vision(
+                    message_text, image_paths
+                )
+        
+        # -----------------------------------------------------------------
+        # Auto-transcribe voice/audio messages sent by the user
+        # -----------------------------------------------------------------
+        if event.media_urls:
+            audio_paths = []
+            for i, path in enumerate(event.media_urls):
+                mtype = event.media_types[i] if i < len(event.media_types) else ""
+                is_audio = (
+                    mtype.startswith("audio/")
+                    or event.message_type in (MessageType.VOICE, MessageType.AUDIO)
+                )
+                if is_audio:
+                    audio_paths.append(path)
+            if audio_paths:
+                message_text = await self._enrich_message_with_transcription(
+                    message_text, audio_paths
+                )
+                # If STT failed, send a direct message to the user so they
+                # know voice isn't configured — don't rely on the agent to
+                # relay the error clearly.
+                _stt_fail_markers = (
+                    "No STT provider",
+                    "STT is disabled",
+                    "can't listen",
+                    "VOICE_TOOLS_OPENAI_KEY",
+                )
+                if any(m in message_text for m in _stt_fail_markers):
+                    _stt_adapter = self.adapters.get(source.platform)
+                    _stt_meta = {"thread_id": source.thread_id} if source.thread_id else None
+                    if _stt_adapter:
+                        try:
+                            _stt_msg = (
+                                "🎤 I received your voice message but can't transcribe it — "
+                                "no speech-to-text provider is configured.\n\n"
+                                "To enable voice: install faster-whisper "
+                                "(`pip install faster-whisper` in the Hermes venv) "
+                                "and set `stt.enabled: true` in config.yaml, "
+                                "then /restart the gateway."
+                            )
+                            # Point to setup skill if it's installed
+                            if self._has_setup_skill():
+                                _stt_msg += "\n\nFor full setup instructions, type: `/skill hermes-agent-setup`"
+                            await _stt_adapter.send(
+                                source.chat_id, _stt_msg,
+                                metadata=_stt_meta,
+                            )
+                        except Exception:
+                            pass
+
+        # -----------------------------------------------------------------
+        # Auto-load platform-specific audio processing skill for voice messages
+        # -----------------------------------------------------------------
+        if event.message_type in (MessageType.VOICE, MessageType.AUDIO):
+            logger.info("[Gateway] Voice/audio message detected, attempting skill auto-load")
+            self._maybe_load_audio_skill(event, source, _is_new_session, _quick_key)
+        # -----------------------------------------------------------------
+        # Enrich document messages with context notes for the agent
+        # -----------------------------------------------------------------
+        if event.media_urls and event.message_type == MessageType.DOCUMENT:
+            import mimetypes as _mimetypes
+            _TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".log", ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg"}
+            for i, path in enumerate(event.media_urls):
+                mtype = event.media_types[i] if i < len(event.media_types) else ""
+                # Fall back to extension-based detection when MIME type is unreliable.
+                if mtype in ("", "application/octet-stream"):
+                    import os as _os2
+                    _ext = _os2.path.splitext(path)[1].lower()
+                    if _ext in _TEXT_EXTENSIONS:
+                        mtype = "text/plain"
+                    else:
+                        guessed, _ = _mimetypes.guess_type(path)
+                        if guessed:
+                            mtype = guessed
+                if not (mtype.startswith("application/") or mtype.startswith("text/")):
+                    continue
+                # Extract display filename by stripping the doc_{uuid12}_ prefix
+                import os as _os
+                basename = _os.path.basename(path)
+                # Format: doc_<12hex>_<original_filename>
+                parts = basename.split("_", 2)
+                display_name = parts[2] if len(parts) >= 3 else basename
+                # Sanitize to prevent prompt injection via filenames
+                import re as _re
+                display_name = _re.sub(r'[^\w.\- ]', '_', display_name)
+
+                if mtype.startswith("text/"):
+                    context_note = (
+                        f"[The user sent a text document: '{display_name}'. "
+                        f"Its content has been included below. "
+                        f"The file is also saved at: {path}]"
+                    )
+                else:
+                    context_note = (
+                        f"[The user sent a document: '{display_name}'. "
+                        f"The file is saved at: {path}. "
+                        f"Ask the user what they'd like you to do with it.]"
+                    )
+                message_text = f"{context_note}\n\n{message_text}"
+
+        # -----------------------------------------------------------------
+        # Inject reply context when user replies to a message not in history.
+        # Telegram (and other platforms) let users reply to specific messages,
+        # but if the quoted message is from a previous session, cron delivery,
+        # or background task, the agent has no context about what's being
+        # referenced. Prepend the quoted text so the agent understands. (#1594)
+        # -----------------------------------------------------------------
+        if getattr(event, 'reply_to_text', None) and event.reply_to_message_id:
+            reply_snippet = event.reply_to_text[:500]
+            found_in_history = any(
+                reply_snippet[:200] in (msg.get("content") or "")
+                for msg in history
+                if msg.get("role") in ("assistant", "user", "tool")
+            )
+            if not found_in_history:
+                message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
 
         try:
             # Emit agent:start hook
