@@ -114,6 +114,15 @@ class SlackAdapter(BasePlatformAdapter):
         self._thread_context_cache: Dict[str, _ThreadContextCache] = {}
         self._THREAD_CACHE_TTL = 60.0
 
+    def _reactions_enabled(self) -> bool:
+        """Check if message reactions are enabled via config/env."""
+        configured = self.config.extra.get("reactions")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() not in ("false", "0", "no", "off")
+            return bool(configured)
+        return os.getenv("SLACK_REACTIONS", "false").lower() not in ("false", "0", "no")
+
     async def connect(self) -> bool:
         """Connect to Slack via Socket Mode."""
         if not SLACK_AVAILABLE:
@@ -1181,16 +1190,13 @@ class SlackAdapter(BasePlatformAdapter):
         # Only react when bot is directly addressed (DM or @mention).
         # In listen-all channels (require_mention=false), reacting to every
         # casual message would be noisy.
-        _should_react = is_dm or is_mentioned
-
-        if _should_react:
-            await self._add_reaction(channel_id, ts, "eyes")
+        _should_react = (is_dm or is_mentioned) and self._reactions_enabled()
 
         await self.handle_message(msg_event)
 
         if _should_react:
             await self._remove_reaction(channel_id, ts, "eyes")
-            await self._add_reaction(channel_id, ts, "white_check_mark")
+            await self._add_reaction(channel_id, ts, "thumbsup")
 
     # ----- Approval button support (Block Kit) -----
 

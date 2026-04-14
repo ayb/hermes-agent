@@ -1,0 +1,40 @@
+Usage:
+  rclone lsd remote:path [flags]
+
+Flags:
+  -h, --help        help for lsd
+  -R, --recursive   Recurse into the listing
+
+Flags for filtering directory listings (flag group Filter):
+      --delete-excluded                     Delete files on dest excluded from sync
+      --exclude stringArray                 Exclude files matching pattern
+      --exclude-from stringArray            Read file exclude patterns from file (use - to read from stdin)
+      --exclude-if-present stringArray      Exclude directories if filename is present
+      --files-from stringArray              Read list of source-file names from file (use - to read from stdin)
+      --files-from-raw stringArray          Read list of source-file names from file without any processing of lines (use - to read from stdin)
+  -f, --filter stringArray                  Add a file filtering rule
+      --filter-from stringArray             Read file filtering patterns from a file (use - to read from stdin)
+      --hash-filter string                  Partition filenames by hash k/n or randomly @/n
+      --ignore-case                         Ignore case in filters (case insensitive)
+      --include stringArray                 Include files matching pattern
+      --include-from stringArray            Read file include patterns from file (use - to read from stdin)
+      --max-age Duration                    Only transfer files younger than this in s or suffix ms|s|m|h|d|w|M|y (default off)
+      --max-depth int                       If set limits the recursion depth to this (default -1)
+      --max-size SizeSuffix                 Only transfer files smaller than this in KiB or suffix B|K|M|G|T|P (default off)
+      --metadata-exclude stringArray        Exclude metadatas matching pattern
+      --metadata-exclude-from stringArray   Read metadata exclude patterns from file (use - to read from stdin)
+      --metadata-filter stringArray         Add a metadata filtering rule
+      --metadata-filter-from stringArray    Read metadata filtering patterns from a file (use - to read from stdin)
+      --metadata-include stringArray        Include metadatas matching pattern
+      --metadata-include-from stringArray   Read metadata include patterns from file (use - to read from stdin)
+      --min-age Duration                    Only transfer files older than this in s or suffix ms|s|m|h|d|w|M|y (default off)
+      --min-size SizeSuffix                 Only transfer files bigger than this in KiB or suffix B|K|M|G|T|P (default off)
+
+Flags for listing directories (flag group Listing):
+      --default-time Time   Time to show if modtime is unknown for files and directories (default 2000-01-01T00:00:00Z)
+      --fast-list           Use recursive list if available; uses more memory but fewer transactions
+
+Use "rclone [command] --help" for more information about a command.
+Use "rclone help flags" for to see the global flags.
+Use "rclone help backends" for a list of supported services.
+Command lsd needs 1 arguments maximum: you provided 2 non flag arguments: ["Dropbox:brands" "/dev/null"]

@@ -3628,8 +3628,6 @@ class GatewayRunner:
         )
         if message_text is None:
             return
-        if _is_shared_thread and source.user_name:
-            message_text = f"[{source.user_name}] {message_text}"
 
         if event.media_urls:
             image_paths = []

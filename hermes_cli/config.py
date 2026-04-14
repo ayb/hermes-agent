@@ -640,6 +640,14 @@ DEFAULT_CONFIG = {
         "reactions": True,             # Add 👀/✅/❌ reactions to messages during processing
     },
 
+    # Slack platform settings (gateway mode)
+    "slack": {
+        "require_mention": True,       # Require @mention to respond in channels
+        "free_response_channels": "",  # Comma-separated channel IDs where bot responds without mention
+        "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
+        "reactions": False,            # Add 👀/✅/❌ reactions to messages during processing
+    },
+
     # WhatsApp platform settings (gateway mode)
     "whatsapp": {
         # Reply prefix prepended to every outgoing WhatsApp message.
