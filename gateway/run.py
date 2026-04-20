@@ -627,6 +627,23 @@ class GatewayRunner:
         from gateway.hooks import HookRegistry
         self.hooks = HookRegistry()
 
+        # KAIROS proactive agent (checks config before enabling)
+        self._kairos_service: Optional[Any] = None
+        try:
+            _cfg = _load_gateway_config()
+            _kairos_cfg = _cfg.get("kairos", {})
+            if _kairos_cfg.get("enabled", False) or os.getenv("KAIROS_ENABLED", "").lower() in ("true", "1", "yes"):
+                from kairos import KAIROSService, PushBridge
+                _push = PushBridge()
+                self._kairos_service = KAIROSService(
+                    model=_kairos_cfg.get("model"),
+                    tick_interval=_kairos_cfg.get("tick_interval", 900),
+                    push_bridge=_push,
+                )
+                logger.info("KAIROS proactive agent enabled")
+        except Exception as e:
+            logger.warning("KAIROS initialization failed (will run without): %s", e)
+
         # Per-chat voice reply mode: "off" | "voice_only" | "all"
         self._voice_mode: Dict[str, str] = self._load_voice_modes()
 
@@ -1820,6 +1837,14 @@ class GatewayRunner:
             )
         asyncio.create_task(self._platform_reconnect_watcher())
 
+        # Start KAIROS proactive agent if initialized
+        if self._kairos_service is not None:
+            try:
+                self._kairos_service.start()
+                logger.info("KAIROS proactive agent started")
+            except Exception as e:
+                logger.warning("KAIROS start failed: %s", e)
+
         logger.info("Press Ctrl+C to stop")
         
         return True
@@ -2128,6 +2153,14 @@ class GatewayRunner:
                     logger.info("✓ %s disconnected", platform.value)
                 except Exception as e:
                     logger.error("✗ %s disconnect error: %s", platform.value, e)
+
+            # Stop KAIROS proactive agent if running
+            if self._kairos_service is not None:
+                try:
+                    self._kairos_service.stop()
+                    logger.info("KAIROS proactive agent stopped")
+                except Exception as e:
+                    logger.warning("KAIROS stop failed: %s", e)
 
             for _task in list(self._background_tasks):
                 if _task is self._stop_task:
