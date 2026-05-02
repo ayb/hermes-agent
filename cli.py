@@ -7070,70 +7070,46 @@ class HermesCLI:
         return mgr
 
     def _handle_goal_command(self, cmd: str) -> None:
-        """Dispatch /goal subcommands: set / status / pause / resume / clear."""
+        """Dispatch /goal subcommands using universal goal API."""
+        from hermes_cli.goals_universal import (
+            set_goal_universal,
+            handle_goal_control_command,
+        )
+        
         parts = (cmd or "").strip().split(None, 1)
         arg = parts[1].strip() if len(parts) > 1 else ""
-
-        mgr = self._get_goal_manager()
-        if mgr is None:
-            _cprint(f"  {_DIM}Goals unavailable (no active session).{_RST}")
-            return
-
+        
+        # Get user info for universal API
+        user_id = getattr(self, "session_id", "cli") or "cli-user"
+        
+        # Control commands
         lower = arg.lower()
-
-        # Bare /goal or /goal status → show current state
-        if not arg or lower == "status":
-            _cprint(f"  {mgr.status_line()}")
+        if not arg or lower in ("status", "pause", "resume", "clear", "stop", "done"):
+            response = handle_goal_control_command(
+                command=arg,
+                user_id=user_id,
+                source="terminal",
+            )
+            _cprint(f"  {response}")
             return
-
-        if lower == "pause":
-            state = mgr.pause(reason="user-paused")
-            if state is None:
-                _cprint(f"  {_DIM}No goal set.{_RST}")
-            else:
-                _cprint(f"  ⏸ Goal paused: {state.goal}")
-            return
-
-        if lower == "resume":
-            state = mgr.resume()
-            if state is None:
-                _cprint(f"  {_DIM}No goal to resume.{_RST}")
-            else:
-                _cprint(f"  ▶ Goal resumed: {state.goal}")
-                _cprint(
-                    f"  {_DIM}Send any message (or press Enter on an empty prompt "
-                    f"is a no-op; type 'continue' to kick it off).{_RST}"
-                )
-            return
-
-        if lower in ("clear", "stop", "done"):
-            had = mgr.has_goal()
-            mgr.clear()
-            if had:
-                _cprint("  ✓ Goal cleared.")
-            else:
-                _cprint(f"  {_DIM}No active goal.{_RST}")
-            return
-
-        # Otherwise treat the arg as the goal text.
-        try:
-            state = mgr.set(arg)
-        except ValueError as exc:
-            _cprint(f"  Invalid goal: {exc}")
-            return
-
-        _cprint(f"  ⊙ Goal set ({state.max_turns}-turn budget): {state.goal}")
-        _cprint(
-            f"  {_DIM}After each turn, a judge model will check if the goal is done. "
-            f"Hermes keeps working until it is, you pause/clear it, or the budget is "
-            f"exhausted. Use /goal status, /goal pause, /goal resume, /goal clear.{_RST}"
+        
+        # Set new goal via universal API
+        result = set_goal_universal(
+            goal_text=arg,
+            source="terminal",
+            user_id=user_id,
+            explicit_session_id=getattr(self, "session_id", None),
         )
-        # Kick the loop off immediately so the user doesn't have to send a
-        # separate message after setting the goal.
-        try:
-            self._pending_input.put(state.goal)
-        except Exception:
-            pass
+        
+        if result.success:
+            _cprint(f"  {result.message}")
+            # Kick off the first turn
+            try:
+                self._pending_input.put(result.platform_replies.get("terminal", result.goal))
+            except Exception:
+                pass
+        else:
+            _cprint(f"  Error: {result.error}")
 
     def _maybe_continue_goal_after_turn(self) -> None:
         """Hook run after every CLI turn. Judges + maybe re-queues.

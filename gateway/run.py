@@ -2729,7 +2729,7 @@ class GatewayRunner:
             if _cmd_def_inner and _cmd_def_inner.name == "goal":
                 _goal_arg = (event.get_command_args() or "").strip().lower()
                 if not _goal_arg or _goal_arg in ("status", "pause", "resume", "clear", "stop", "done"):
-                    return await self._handle_goal_command(event)
+                    return await self._handle_goal_command_universal(event)
                 return "Agent is running — use /goal status / pause / clear mid-run, or /stop before setting a new goal."
 
             # /background must bypass the running-agent guard — it starts a
@@ -2910,7 +2910,7 @@ class GatewayRunner:
             return await self._handle_btw_command(event)
 
         if canonical == "goal":
-            return await self._handle_goal_command(event)
+            return await self._handle_goal_command_universal(event)
 
         if canonical == "voice":
             return await self._handle_voice_command(event)
@@ -5224,6 +5224,52 @@ class GatewayRunner:
                 self._enqueue_fifo(_quick_key, cont_event, adapter)
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
+
+    async def _handle_goal_command_universal(self, event) -> str:
+        """Handle /goal using universal goal API.
+        
+        Supports goals from Slack, Terminal, Email, RTM, and API.
+        """
+        from hermes_cli.goals_universal import (
+            set_goal_universal,
+            handle_goal_control_command,
+            generate_session_id
+        )
+        
+        # Extract user and source info from event
+        source = event.source
+        user_id = source.user_id if source else "unknown"
+        platform = source.platform if source else "unknown"
+        channel_id = source.channel_id if source else None
+        thread_id = source.thread_id if source else None
+        
+        args = (event.get_command_args() or "").strip()
+        lower = args.lower()
+        
+        # Control commands (status, pause, resume, clear)
+        if not args or lower in ("status", "pause", "resume", "clear", "stop", "done"):
+            return handle_goal_control_command(
+                command=args,
+                user_id=user_id,
+                source=platform,
+                channel_id=channel_id,
+                thread_id=thread_id,
+            )
+        
+        # Set new goal
+        result = set_goal_universal(
+            goal_text=args,
+            source=platform,
+            user_id=user_id,
+            channel_id=channel_id,
+            thread_id=thread_id,
+        )
+        
+        if result.success:
+            # Return platform-specific reply
+            return result.platform_replies.get(platform, result.message)
+        
+        return f"Failed to set goal: {result.error}"
 
     async def _handle_undo_command(self, event: MessageEvent) -> str:
         """Handle /undo command - remove the last user/assistant exchange."""
