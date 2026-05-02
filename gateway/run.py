@@ -2721,6 +2721,17 @@ class GatewayRunner:
                     return await self._handle_approve_command(event)
                 return await self._handle_deny_command(event)
 
+            # /goal is safe mid-run for status/pause/clear (inspection and
+            # control-plane only — doesn't interrupt the running turn).
+            # Setting a new goal text mid-run is rejected with the same
+            # "wait or /stop" message as /model so we don't race a second
+            # continuation prompt against the current turn.
+            if _cmd_def_inner and _cmd_def_inner.name == "goal":
+                _goal_arg = (event.get_command_args() or "").strip().lower()
+                if not _goal_arg or _goal_arg in ("status", "pause", "resume", "clear", "stop", "done"):
+                    return await self._handle_goal_command(event)
+                return "Agent is running — use /goal status / pause / clear mid-run, or /stop before setting a new goal."
+
             # /background must bypass the running-agent guard — it starts a
             # parallel task and must never interrupt the active conversation.
             if _cmd_def_inner and _cmd_def_inner.name == "background":
@@ -2898,6 +2909,9 @@ class GatewayRunner:
         if canonical == "btw":
             return await self._handle_btw_command(event)
 
+        if canonical == "goal":
+            return await self._handle_goal_command(event)
+
         if canonical == "voice":
             return await self._handle_voice_command(event)
 
@@ -3043,7 +3057,22 @@ class GatewayRunner:
         self._running_agents_ts[_quick_key] = time.time()
 
         try:
-            return await self._handle_message_with_agent(event, source, _quick_key)
+            _agent_result = await self._handle_message_with_agent(event, source, _quick_key)
+            # Goal continuation: after the agent returns a final response
+            # for this turn, check any standing /goal — the judge will
+            # either mark it done, pause it (budget), or enqueue a
+            # continuation prompt back through the adapter FIFO so the
+            # next turn continues toward the goal automatically.
+            try:
+                session_entry = self.session_store.get_or_create_session(source)
+                self._post_turn_goal_continuation(
+                    session_entry=session_entry,
+                    source=source,
+                    final_response=_agent_result if isinstance(_agent_result, str) else "",
+                )
+            except Exception as _goal_exc:
+                logger.debug("goal continuation hook failed: %s", _goal_exc)
+            return _agent_result
         finally:
             # If _run_agent replaced the sentinel with a real agent and
             # then cleaned it up, this is a no-op.  If we exited early
@@ -4998,7 +5027,204 @@ class GatewayRunner:
         
         # Let the normal message handler process it
         return await self._handle_message(retry_event)
-    
+
+    # ─────────────────────────────────────────────────────────────────
+    # /goal — persistent cross-turn goals (Ralph-style loop)
+    # ─────────────────────────────────────────────────────────────────
+    def _get_goal_manager_for_event(self, event: "MessageEvent"):
+        """Return a GoalManager bound to the session for this gateway event.
+
+        Returns ``(manager, session_entry)`` or ``(None, None)`` if the
+        goals module can't be loaded.
+        """
+        try:
+            from hermes_cli.goals import GoalManager
+        except Exception as exc:
+            logger.debug("goal manager unavailable: %s", exc)
+            return None, None
+        try:
+            session_entry = self.session_store.get_or_create_session(event.source)
+        except Exception as exc:
+            logger.debug("goal manager: session lookup failed: %s", exc)
+            return None, None
+        sid = getattr(session_entry, "session_id", None) or ""
+        if not sid:
+            return None, None
+        try:
+            goals_cfg = (
+                (self.config or {}).get("goals", {})
+                if isinstance(self.config, dict)
+                else getattr(self.config, "goals", {}) or {}
+            )
+            max_turns = int(goals_cfg.get("max_turns", 20) or 20)
+        except Exception:
+            max_turns = 20
+        return GoalManager(session_id=sid, default_max_turns=max_turns), session_entry
+
+    async def _handle_goal_command(self, event: "MessageEvent") -> str:
+        """Handle /goal for gateway platforms.
+
+        Subcommands: ``/goal`` / ``/goal status`` / ``/goal pause`` /
+        ``/goal resume`` / ``/goal clear``. Any other text becomes the
+        new goal.
+
+        Setting a new goal queues the goal text as the next turn so the
+        agent starts working on it immediately — the post-turn
+        continuation hook then takes over from there.
+        """
+        args = (event.get_command_args() or "").strip()
+        lower = args.lower()
+
+        mgr, session_entry = self._get_goal_manager_for_event(event)
+        if mgr is None:
+            return "Goals unavailable on this session."
+
+        if not args or lower == "status":
+            return mgr.status_line()
+
+        if lower == "pause":
+            state = mgr.pause(reason="user-paused")
+            if state is None:
+                return "No goal set."
+            return f"⏸ Goal paused: {state.goal}"
+
+        if lower == "resume":
+            state = mgr.resume()
+            if state is None:
+                return "No goal to resume."
+            return (
+                f"▶ Goal resumed: {state.goal}\n"
+                "Send any message to continue, or wait — I'll take the next step on the next turn."
+            )
+
+        if lower in ("clear", "stop", "done"):
+            had = mgr.has_goal()
+            mgr.clear()
+            return "✓ Goal cleared." if had else "No active goal."
+
+        # Otherwise — treat the remaining text as the new goal.
+        try:
+            state = mgr.set(args)
+        except ValueError as exc:
+            return f"Invalid goal: {exc}"
+
+        # Queue the goal text as an immediate first turn so the agent
+        # starts making progress. The post-turn hook takes over after.
+        adapter = self.adapters.get(event.source.platform) if event.source else None
+        _quick_key = self._session_key_for_source(event.source) if event.source else None
+        if adapter and _quick_key:
+            try:
+                from gateway.session import MessageEvent, MessageType
+                kickoff_event = MessageEvent(
+                    text=state.goal,
+                    message_type=MessageType.TEXT,
+                    source=event.source,
+                    message_id=event.message_id,
+                    channel_prompt=event.channel_prompt,
+                )
+                self._enqueue_fifo(_quick_key, kickoff_event, adapter)
+            except Exception as exc:
+                logger.debug("goal kickoff enqueue failed: %s", exc)
+
+        return (
+            f"⊙ Goal set ({state.max_turns}-turn budget): {state.goal}\n"
+            "I'll keep working until the goal is done, you pause/clear it, or the budget is exhausted.\n"
+            "Controls: /goal status · /goal pause · /goal resume · /goal clear"
+        )
+
+    def _post_turn_goal_continuation(
+        self,
+        *,
+        session_entry: Any,
+        source: Any,
+        final_response: str,
+    ) -> None:
+        """Run the goal judge after a gateway turn and, if still active,
+        enqueue a continuation prompt for the same session.
+
+        Called from ``_handle_message_with_agent`` at turn boundary, AFTER
+        the response has been delivered. Safe when no goal is set.
+
+        We use the adapter's pending-message / FIFO machinery so any real
+        user message that arrives simultaneously is handled by the same
+        queue and takes priority naturally.
+        """
+        try:
+            from hermes_cli.goals import GoalManager
+        except Exception as exc:
+            logger.debug("goal continuation: goals module unavailable: %s", exc)
+            return
+
+        sid = getattr(session_entry, "session_id", None) or ""
+        if not sid:
+            return
+
+        try:
+            goals_cfg = (
+                (self.config or {}).get("goals", {})
+                if isinstance(self.config, dict)
+                else getattr(self.config, "goals", {}) or {}
+            )
+            max_turns = int(goals_cfg.get("max_turns", 20) or 20)
+        except Exception:
+            max_turns = 20
+
+        mgr = GoalManager(session_id=sid, default_max_turns=max_turns)
+        if not mgr.is_active():
+            return
+
+        decision = mgr.evaluate_after_turn(final_response or "", user_initiated=True)
+        msg = decision.get("message") or ""
+
+        # Send the status line back to the user so they see the judge's
+        # verdict. Fire-and-forget via the adapter.
+        if msg and source is not None:
+            try:
+                adapter = self.adapters.get(source.platform)
+                if adapter and hasattr(adapter, "send_message"):
+                    import asyncio as _asyncio
+                    coro = adapter.send_message(source, msg)
+                    if _asyncio.iscoroutine(coro):
+                        try:
+                            loop = _asyncio.get_event_loop()
+                            if loop.is_running():
+                                loop.create_task(coro)
+                            else:
+                                loop.run_until_complete(coro)
+                        except RuntimeError:
+                            # No event loop in this thread — schedule on the main one.
+                            try:
+                                _asyncio.run_coroutine_threadsafe(coro, self._loop)
+                            except Exception:
+                                pass
+            except Exception as exc:
+                logger.debug("goal continuation: status send failed: %s", exc)
+
+        if not decision.get("should_continue"):
+            return
+
+        prompt = decision.get("continuation_prompt") or ""
+        if not prompt or source is None:
+            return
+
+        # Enqueue via the adapter's FIFO so a user message already in
+        # flight preempts the continuation naturally.
+        try:
+            adapter = self.adapters.get(source.platform)
+            _quick_key = self._session_key_for_source(source)
+            if adapter and _quick_key:
+                from gateway.session import MessageEvent, MessageType
+                cont_event = MessageEvent(
+                    text=prompt,
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    message_id=None,
+                    channel_prompt=None,
+                )
+                self._enqueue_fifo(_quick_key, cont_event, adapter)
+        except Exception as exc:
+            logger.debug("goal continuation: enqueue failed: %s", exc)
+
     async def _handle_undo_command(self, event: MessageEvent) -> str:
         """Handle /undo command - remove the last user/assistant exchange."""
         source = event.source
@@ -7096,6 +7322,22 @@ class GatewayRunner:
         """
         import json
         import re as _re
+
+        # Check if update notifications are disabled
+        try:
+            from hermes_cli.config import load_cli_config
+            user_config = load_cli_config()
+            if user_config.get("update", {}).get("notify") is False:
+                # Clean up pending files without notifying
+                pending_path = _hermes_home / ".update_pending.json"
+                claimed_path = _hermes_home / ".update_pending.claimed.json"
+                output_path = _hermes_home / ".update_output.txt"
+                exit_code_path = _hermes_home / ".update_exit_code"
+                for p in (pending_path, claimed_path, output_path, exit_code_path):
+                    p.unlink(missing_ok=True)
+                return True
+        except Exception:
+            pass
 
         pending_path = _hermes_home / ".update_pending.json"
         claimed_path = _hermes_home / ".update_pending.claimed.json"
